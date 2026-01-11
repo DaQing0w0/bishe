@@ -39,6 +39,6 @@ require (
 
 // replace github.com/syifan/goseth => ../goseth
 
-// replace github.com/sarchlab/akita/v4 => ../akita
+replace github.com/sarchlab/akita/v4 => ../akita-4.3.3
 
 go 1.24
