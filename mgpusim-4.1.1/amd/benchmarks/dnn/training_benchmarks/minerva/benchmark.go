@@ -70,11 +70,11 @@ func (b *Benchmark) defineNetwork(gpuID int) {
 		Layers: []layers.Layer{
 			layers.NewFullyConnectedLayer(0, to, 784, 128),
 			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(2, to, 256, 100),
+			layers.NewFullyConnectedLayer(2, to, 128, 64),
 			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(4, to, 100, 100),
-			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(6, to, 100, 10),
+			// layers.NewFullyConnectedLayer(4, to, 100, 100),
+			// layers.NewReluLayer(to),
+			layers.NewFullyConnectedLayer(4, to, 64, 10),
 		},
 	}
 
