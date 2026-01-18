@@ -3,11 +3,14 @@ package runner
 
 import (
 	"log"
+	"os"
+	"strings"
 
 	// Enable profiling
 	_ "net/http/pprof"
 	"sync"
 
+	"github.com/sarchlab/akita/v4/mem/mem"
 	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/akita/v4/simulation"
 	"github.com/sarchlab/akita/v4/tracing"
@@ -37,7 +40,26 @@ type Runner struct {
 
 	GPUIDs     []int
 	benchmarks []benchmarks.Benchmark
+
+	memLog *os.File
 }
+
+// 只记录地址序列的轻量 tracer
+type addrSeqTracer struct {
+	logger     *log.Logger
+	timeTeller sim.TimeTeller
+}
+
+func (t *addrSeqTracer) StartTask(task tracing.Task) {
+	if req, ok := task.Detail.(mem.AccessReq); ok {
+		ts := t.timeTeller.CurrentTime()
+		t.logger.Printf("start, %.12f, %s, 0x%x, %d\n",
+			ts, task.ID, req.GetAddress(), req.GetByteSize())
+	}
+}
+func (t *addrSeqTracer) StepTask(task tracing.Task)       {}
+func (t *addrSeqTracer) AddMilestone(m tracing.Milestone) {}
+func (t *addrSeqTracer) EndTask(task tracing.Task)        {}
 
 // Init initializes the platform simulate
 func (r *Runner) Init() *Runner {
@@ -94,6 +116,37 @@ func (r *Runner) buildTimingPlatform() {
 	r.platform = b.Build()
 	r.reporter = newReporter(r.simulation)
 	r.configureVisTracing()
+	f, err := os.Create("mem.log")
+	if err != nil {
+		panic(err)
+	}
+	r.memLog = f
+	logger := log.New(f, "", 0)
+	memTracer := &addrSeqTracer{
+		logger:     logger,
+		timeTeller: r.simulation.GetEngine(),
+	}
+
+	// 仅挂内存相关组件，按名称包含以下子串过滤
+	filters := []string{"DRAM", "MemCtrl", "Memory", "L2"}
+	hooked := 0
+	for _, c := range r.simulation.Components() {
+		okMatch := false
+		for _, s := range filters {
+			if strings.Contains(c.Name(), s) {
+				okMatch = true
+				break
+			}
+		}
+		if !okMatch {
+			continue
+		}
+		if hookable, ok := c.(tracing.NamedHookable); ok {
+			tracing.CollectTrace(hookable, memTracer)
+			hooked++
+		}
+	}
+	log.Printf("[memtrace] hooked %d components", hooked)
 }
 
 func (r *Runner) configureVisTracing() {
@@ -167,6 +220,10 @@ func (r *Runner) Run() {
 
 	r.Driver().Terminate()
 	r.simulation.Terminate()
+
+	if r.memLog != nil {
+		r.memLog.Close()
+	}
 }
 
 // Driver returns the GPU driver used by the current runner.
