@@ -41,22 +41,37 @@ type Runner struct {
 	GPUIDs     []int
 	benchmarks []benchmarks.Benchmark
 
-	memLog *os.File
+	memLog    *os.File
+	memTracer *addrSeqTracer
+}
+
+// epochAware is an interface for trainers that are aware of the current epoch.
+type epochAware interface {
+	CurrentEpoch() int
 }
 
 // 只记录地址序列的轻量 tracer
 type addrSeqTracer struct {
-	logger     *log.Logger
-	timeTeller sim.TimeTeller
+	logger      *log.Logger
+	timeTeller  sim.TimeTeller
+	epochGetter func() int
 }
 
+// get address(inspired by akita/mem/trace/tracer.go)
 func (t *addrSeqTracer) StartTask(task tracing.Task) {
 	if req, ok := task.Detail.(mem.AccessReq); ok {
 		ts := t.timeTeller.CurrentTime()
-		t.logger.Printf("start, %.12f, %s, 0x%x, %d\n",
-			ts, task.ID, req.GetAddress(), req.GetByteSize())
+		epoch := -1
+		if t.epochGetter != nil {
+			epoch = t.epochGetter()
+		}
+		// CSV: time,task_id,address,bytes,epoch
+		t.logger.Printf("%.12f,%s,0x%x,%d,%d\n",
+			ts, task.ID, req.GetAddress(), req.GetByteSize(), epoch)
 	}
 }
+
+// DO NOTHING
 func (t *addrSeqTracer) StepTask(task tracing.Task)       {}
 func (t *addrSeqTracer) AddMilestone(m tracing.Milestone) {}
 func (t *addrSeqTracer) EndTask(task tracing.Task)        {}
@@ -116,16 +131,20 @@ func (r *Runner) buildTimingPlatform() {
 	r.platform = b.Build()
 	r.reporter = newReporter(r.simulation)
 	r.configureVisTracing()
-	f, err := os.Create("mem.log")
+	f, err := os.Create("mem.csv")
 	if err != nil {
 		panic(err)
 	}
 	r.memLog = f
+	// 写 CSV 表头
+	_, _ = f.WriteString("time,task_id,address,bytes,epoch\n")
+
 	logger := log.New(f, "", 0)
 	memTracer := &addrSeqTracer{
 		logger:     logger,
 		timeTeller: r.simulation.GetEngine(),
 	}
+	r.memTracer = memTracer
 
 	// 仅挂内存相关组件，按名称包含以下子串过滤
 	filters := []string{"DRAM", "MemCtrl", "Memory", "L2"}
@@ -177,6 +196,13 @@ func (r *Runner) AddBenchmark(b benchmarks.Benchmark) {
 		b.SetUnifiedMemory()
 	}
 
+	// 绑定 epochGetter（如果benchmark支持）
+	if r.memTracer != nil {
+		if ea, ok := b.(epochAware); ok {
+			r.memTracer.epochGetter = ea.CurrentEpoch
+		}
+	}
+
 	r.benchmarks = append(r.benchmarks, b)
 }
 
@@ -185,6 +211,12 @@ func (r *Runner) AddBenchmark(b benchmarks.Benchmark) {
 func (r *Runner) AddBenchmarkWithoutSettingGPUsToUse(b benchmarks.Benchmark) {
 	if r.UseUnifiedMemory {
 		b.SetUnifiedMemory()
+	}
+
+	if r.memTracer != nil {
+		if ea, ok := b.(epochAware); ok {
+			r.memTracer.epochGetter = ea.CurrentEpoch
+		}
 	}
 
 	r.benchmarks = append(r.benchmarks, b)

@@ -31,12 +31,20 @@ type DataParallelismMultiGPUTrainer struct {
 	GPUs             []int
 	Contexts         []*driver.Context
 	Driver           *driver.Driver
+
+	currentEpoch int
+}
+
+// CurrentEpoch returns the current epoch number.
+func (t *DataParallelismMultiGPUTrainer) CurrentEpoch() int {
+	return t.currentEpoch
 }
 
 // Train will run the training algorithm on the network.
-func (t DataParallelismMultiGPUTrainer) Train() {
+func (t *DataParallelismMultiGPUTrainer) Train() {
 	for currentEpoch := 0; currentEpoch < t.Epoch; currentEpoch++ {
 		log.Printf("Epoch %d\n", currentEpoch)
+		t.currentEpoch = int(currentEpoch)
 
 		for i := 0; i < len(t.DataSource); i++ {
 			dataSource := t.DataSource[i]
@@ -67,7 +75,7 @@ func (t DataParallelismMultiGPUTrainer) Train() {
 	}
 }
 
-func (t DataParallelismMultiGPUTrainer) calculateBatchGradientAllGPUs() (
+func (t *DataParallelismMultiGPUTrainer) calculateBatchGradientAllGPUs() (
 	epochCompleted bool,
 ) {
 	var wg sync.WaitGroup
@@ -92,7 +100,7 @@ func (t DataParallelismMultiGPUTrainer) calculateBatchGradientAllGPUs() (
 	return epochCompleted
 }
 
-func (t DataParallelismMultiGPUTrainer) calculateBatchGradientOneGPU(
+func (t *DataParallelismMultiGPUTrainer) calculateBatchGradientOneGPU(
 	network training.Network,
 	data tensor.Tensor, label []int,
 	wg *sync.WaitGroup,
@@ -105,7 +113,7 @@ func (t DataParallelismMultiGPUTrainer) calculateBatchGradientOneGPU(
 	t.backward(derivative, &network)
 }
 
-func (t DataParallelismMultiGPUTrainer) forward(
+func (t *DataParallelismMultiGPUTrainer) forward(
 	data tensor.Tensor,
 	network *training.Network,
 ) tensor.Tensor {
@@ -118,7 +126,7 @@ func (t DataParallelismMultiGPUTrainer) forward(
 	return output
 }
 
-func (t DataParallelismMultiGPUTrainer) calculateLoss(
+func (t *DataParallelismMultiGPUTrainer) calculateLoss(
 	output tensor.Tensor,
 	inputLabel []int,
 	lossFunc training.LossFunction,
@@ -133,7 +141,7 @@ func (t DataParallelismMultiGPUTrainer) calculateLoss(
 	return derivative
 }
 
-func (t DataParallelismMultiGPUTrainer) backward(
+func (t *DataParallelismMultiGPUTrainer) backward(
 	derivative tensor.Tensor,
 	network *training.Network,
 ) {
@@ -145,7 +153,7 @@ func (t DataParallelismMultiGPUTrainer) backward(
 	}
 }
 
-func (t DataParallelismMultiGPUTrainer) updateParameters() {
+func (t *DataParallelismMultiGPUTrainer) updateParameters() {
 	if len(t.Networks) > 1 {
 		t.averageGradient()
 	}
@@ -160,7 +168,7 @@ func (t DataParallelismMultiGPUTrainer) updateParameters() {
 	}
 }
 
-func (t DataParallelismMultiGPUTrainer) averageGradient() {
+func (t *DataParallelismMultiGPUTrainer) averageGradient() {
 	for l := range t.Networks[0].Layers {
 		if t.Networks[0].Layers[l].Gradients() == nil {
 			continue
@@ -195,7 +203,7 @@ func (t DataParallelismMultiGPUTrainer) averageGradient() {
 	}
 }
 
-func (t DataParallelismMultiGPUTrainer) test() {
+func (t *DataParallelismMultiGPUTrainer) test() {
 	if t.Tester == nil {
 		return
 	}

@@ -24,7 +24,7 @@ type Benchmark struct {
 	contexts []*driver.Context
 
 	networks []training.Network
-	trainer  gputraining.DataParallelismMultiGPUTrainer
+	trainer  *gputraining.DataParallelismMultiGPUTrainer
 
 	BatchSize          int
 	Epoch              int
@@ -103,7 +103,7 @@ func (b *Benchmark) createTrainer() {
 		}
 	}
 
-	b.trainer = gputraining.DataParallelismMultiGPUTrainer{
+	b.trainer = &gputraining.DataParallelismMultiGPUTrainer{
 		TensorOperators:  b.to,
 		DataSource:       sources,
 		Networks:         b.networks,
@@ -169,4 +169,12 @@ func (b *Benchmark) Verify() {
 // SetUnifiedMemory asks the benchmark to use unified memory.
 func (b *Benchmark) SetUnifiedMemory() {
 	panic("unified memory is not supported by dnn workloads")
+}
+
+// CurrentEpoch implements runner.epochAware
+func (b *Benchmark) CurrentEpoch() int {
+	if b.trainer != nil {
+		return b.trainer.CurrentEpoch()
+	}
+	return -1
 }
