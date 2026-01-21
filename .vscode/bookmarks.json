@@ -9,6 +9,36 @@
 					"label": ""
 				}
 			]
+		},
+		{
+			"path": "akita-4.3.3/tracing/tracehook.go",
+			"bookmarks": [
+				{
+					"line": 10,
+					"column": 0,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "mgpusim-4.1.1/amd/driver/api.go",
+			"bookmarks": [
+				{
+					"line": 205,
+					"column": 0,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "mgpusim-4.1.1/amd/benchmarks/dnn/gputensor/operator.go",
+			"bookmarks": [
+				{
+					"line": 421,
+					"column": 0,
+					"label": ""
+				}
+			]
 		}
 	]
 }

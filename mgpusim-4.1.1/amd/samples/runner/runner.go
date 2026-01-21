@@ -59,6 +59,9 @@ type addrSeqTracer struct {
 
 // get address(inspired by akita/mem/trace/tracer.go)
 func (t *addrSeqTracer) StartTask(task tracing.Task) {
+	if strings.Contains(task.ID, "req_out") { // 跳过 req_out
+		return
+	}
 	if req, ok := task.Detail.(mem.AccessReq); ok {
 		ts := t.timeTeller.CurrentTime()
 		epoch := -1
@@ -146,8 +149,8 @@ func (r *Runner) buildTimingPlatform() {
 	}
 	r.memTracer = memTracer
 
-	// 仅挂内存相关组件，按名称包含以下子串过滤
-	filters := []string{"DRAM", "MemCtrl", "Memory", "L2"}
+	// 按名称过滤并挂载组件
+	filters := []string{"L1VAddrTrans"}
 	hooked := 0
 	for _, c := range r.simulation.Components() {
 		okMatch := false
