@@ -55,6 +55,7 @@ type addrSeqTracer struct {
 	logger      *log.Logger
 	timeTeller  sim.TimeTeller
 	epochGetter func() int
+	pageFinder  *driver.Driver
 }
 
 // get address(inspired by akita/mem/trace/tracer.go)
@@ -68,9 +69,40 @@ func (t *addrSeqTracer) StartTask(task tracing.Task) {
 		if t.epochGetter != nil {
 			epoch = t.epochGetter()
 		}
-		// CSV: time,task_id,address,bytes,epoch
-		t.logger.Printf("%.12f,%s,0x%x,%d,%d\n",
-			ts, task.ID, req.GetAddress(), req.GetByteSize(), epoch)
+
+		pid := req.GetPID()
+		pageVAddr := uint64(0)
+		pagePAddr := uint64(0)
+		pageSize := uint64(0)
+		pageDevice := uint64(0)
+		found := false
+
+		if t.pageFinder != nil && pid != 0 {
+			page, ok := t.pageFinder.FindPage(pid, req.GetAddress())
+			if ok {
+				pageVAddr = page.VAddr
+				pagePAddr = page.PAddr
+				pageSize = page.PageSize
+				pageDevice = page.DeviceID
+				found = true
+			}
+		}
+
+		// CSV:
+		// time,task_id,address,bytes,epoch,pid,page_vaddr,page_paddr,page_size,page_device,found
+		t.logger.Printf("%.12f,%s,0x%x,%d,%d,%d,0x%x,0x%x,%d,%d,%t\n",
+			ts,
+			task.ID,
+			req.GetAddress(),
+			req.GetByteSize(),
+			epoch,
+			pid,
+			pageVAddr/4096, // 记录页号
+			pagePAddr,
+			pageSize,
+			pageDevice,
+			found,
+		)
 	}
 }
 
@@ -140,12 +172,13 @@ func (r *Runner) buildTimingPlatform() {
 	}
 	r.memLog = f
 	// 写 CSV 表头
-	_, _ = f.WriteString("time,task_id,address,bytes,epoch\n")
+	_, _ = f.WriteString("time,task_id,address,bytes,epoch,pid,page_vnum,page_paddr,page_size,page_device,found\n")
 
 	logger := log.New(f, "", 0)
 	memTracer := &addrSeqTracer{
 		logger:     logger,
 		timeTeller: r.simulation.GetEngine(),
+		pageFinder: r.Driver(),
 	}
 	r.memTracer = memTracer
 

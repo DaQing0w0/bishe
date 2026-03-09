@@ -216,6 +216,12 @@ func (d *Driver) FreeMemory(ctx *Context, ptr Ptr) error {
 	return nil
 }
 
+// FindPage returns the page table entry that contains the given virtual
+// address for a process.
+func (d *Driver) FindPage(pid vm.PID, vAddr uint64) (vm.Page, bool) {
+	return d.pageTable.Find(pid, vAddr)
+}
+
 // EnqueueMemCopyH2D registers a MemCopyH2DCommand in the queue.
 func (d *Driver) EnqueueMemCopyH2D(
 	queue *CommandQueue,

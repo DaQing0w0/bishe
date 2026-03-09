@@ -39,6 +39,26 @@
 					"label": ""
 				}
 			]
+		},
+		{
+			"path": "mgpusim-4.1.1/amd/timing/cu/defaultcoalescer.go",
+			"bookmarks": [
+				{
+					"line": 13,
+					"column": 0,
+					"label": ""
+				}
+			]
+		},
+		{
+			"path": "akita-4.3.3/mem/vm/pagetable.go",
+			"bookmarks": [
+				{
+					"line": 12,
+					"column": 0,
+					"label": ""
+				}
+			]
 		}
 	]
 }
