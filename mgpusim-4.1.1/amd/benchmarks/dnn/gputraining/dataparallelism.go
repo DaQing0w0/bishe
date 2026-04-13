@@ -32,6 +32,9 @@ type DataParallelismMultiGPUTrainer struct {
 	Contexts         []*driver.Context
 	Driver           *driver.Driver
 
+	EnableEpochPageAllocTrace bool
+	PageAllocTraceDir         string
+
 	currentEpoch int
 }
 
@@ -42,9 +45,18 @@ func (t *DataParallelismMultiGPUTrainer) CurrentEpoch() int {
 
 // Train will run the training algorithm on the network.
 func (t *DataParallelismMultiGPUTrainer) Train() {
+	if t.EnableEpochPageAllocTrace {
+		t.Driver.EnableEpochPageAllocationTrace(t.PageAllocTraceDir)
+		defer t.Driver.DisableEpochPageAllocationTrace()
+	}
+
 	for currentEpoch := 0; currentEpoch < t.Epoch; currentEpoch++ {
 		log.Printf("Epoch %d\n", currentEpoch)
 		t.currentEpoch = int(currentEpoch)
+
+		if t.EnableEpochPageAllocTrace {
+			t.Driver.BeginEpochPageAllocationTrace(t.Contexts, currentEpoch)
+		}
 
 		for i := 0; i < len(t.DataSource); i++ {
 			dataSource := t.DataSource[i]
@@ -72,6 +84,13 @@ func (t *DataParallelismMultiGPUTrainer) Train() {
 		}
 
 		t.test()
+
+		if t.EnableEpochPageAllocTrace {
+			err := t.Driver.EndEpochPageAllocationTrace(t.Contexts)
+			if err != nil {
+				panic(err)
+			}
+		}
 	}
 }
 

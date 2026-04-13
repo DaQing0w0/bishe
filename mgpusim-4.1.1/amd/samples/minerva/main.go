@@ -30,7 +30,8 @@ func main() {
 	benchmark.BatchSize = *batchSizeFlag
 	benchmark.EnableTesting = *enableTestingFlag
 	benchmark.EnableVerification = *enableVerification
-
+	benchmark.EnablePageAllocationTrace = true
+	benchmark.PageAllocationTraceDir = "minerva_page_alloc_trace"
 	runner.AddBenchmark(benchmark)
 
 	runner.Run()

@@ -165,6 +165,15 @@ func (a *memoryAllocatorImpl) allocatePages(
 		// debug.PrintStack()
 		a.pageTable.Insert(page)
 		a.vAddrToPageMapping[page.VAddr] = page
+		emitPageAllocated(PageAllocationEvent{
+			PID:      page.PID,
+			VAddr:    page.VAddr,
+			PAddr:    page.PAddr,
+			PageSize: page.PageSize,
+			DeviceID: page.DeviceID,
+			Unified:  page.Unified,
+			Cause:    "allocate",
+		})
 	}
 
 	pState.nextVAddr += pageSize * uint64(numPages)
@@ -246,6 +255,15 @@ func (a *memoryAllocatorImpl) allocatePageWithGivenVAddr(
 	}
 	a.vAddrToPageMapping[page.VAddr] = page
 	a.pageTable.Update(page)
+	emitPageAllocated(PageAllocationEvent{
+		PID:      page.PID,
+		VAddr:    page.VAddr,
+		PAddr:    page.PAddr,
+		PageSize: page.PageSize,
+		DeviceID: page.DeviceID,
+		Unified:  page.Unified,
+		Cause:    "remap",
+	})
 
 	return page
 }
@@ -273,6 +291,15 @@ func (a *memoryAllocatorImpl) allocateMultiplePagesWithGivenVAddrs(
 		}
 		a.vAddrToPageMapping[page.VAddr] = page
 		a.pageTable.Update(page)
+		emitPageAllocated(PageAllocationEvent{
+			PID:      page.PID,
+			VAddr:    page.VAddr,
+			PAddr:    page.PAddr,
+			PageSize: page.PageSize,
+			DeviceID: page.DeviceID,
+			Unified:  page.Unified,
+			Cause:    "remap",
+		})
 		pages = append(pages, page)
 	}
 

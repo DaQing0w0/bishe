@@ -31,6 +31,9 @@ type Benchmark struct {
 	MaxBatchPerEpoch   int
 	EnableTesting      bool
 	EnableVerification bool
+
+	EnablePageAllocationTrace bool
+	PageAllocationTraceDir    string
 }
 
 // NewBenchmark creates a new benchmark.
@@ -117,6 +120,9 @@ func (b *Benchmark) createTrainer() {
 		GPUs:             b.gpus,
 		Contexts:         b.contexts,
 		Driver:           b.driver,
+
+		EnableEpochPageAllocTrace: b.EnablePageAllocationTrace,
+		PageAllocTraceDir:         b.PageAllocationTraceDir,
 	}
 }
 

@@ -59,6 +59,8 @@ type Driver struct {
 	isCurrentlyMigratingOnePage     bool
 
 	RemotePMCPorts []sim.Port
+
+	pageAllocTracer *epochPageAllocTracer
 }
 
 // Run starts a new threads that handles all commands in the command queues

@@ -97,7 +97,7 @@ func (t *addrSeqTracer) StartTask(task tracing.Task) {
 			req.GetByteSize(),
 			epoch,
 			pid,
-			pageVAddr/4096, // 记录页号
+			pageVAddr, // 记录页号
 			pagePAddr,
 			pageSize,
 			pageDevice,
