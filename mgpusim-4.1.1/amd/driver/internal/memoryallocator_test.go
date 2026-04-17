@@ -94,6 +94,45 @@ var _ = Describe("MemoryAllocatorImpl", func() {
 		pageTable.EXPECT().Update(updatedPage)
 		allocator.Remap(1, ptr, 4000, 2)
 	})
+
+	It("should remove page mapping when free", func() {
+		page := vm.Page{
+			PID:      1,
+			PAddr:    0x1_0000_1000,
+			VAddr:    4096,
+			PageSize: 4096,
+			DeviceID: 1,
+			Valid:    true,
+		}
+
+		pageTable.EXPECT().Insert(page)
+		ptr := allocator.Allocate(1, 8, 1)
+
+		pageTable.EXPECT().Remove(vm.PID(1), uint64(4096))
+		allocator.Free(ptr)
+
+		_, found := allocator.vAddrToPageMapping[uint64(ptr)]
+		Expect(found).To(BeFalse())
+	})
+
+	It("should ignore duplicate free", func() {
+		page := vm.Page{
+			PID:      1,
+			PAddr:    0x1_0000_1000,
+			VAddr:    4096,
+			PageSize: 4096,
+			DeviceID: 1,
+			Valid:    true,
+		}
+
+		pageTable.EXPECT().Insert(page)
+		ptr := allocator.Allocate(1, 8, 1)
+
+		pageTable.EXPECT().Remove(vm.PID(1), uint64(4096))
+		allocator.Free(ptr)
+
+		Expect(func() { allocator.Free(ptr) }).ToNot(Panic())
+	})
 })
 
 func configAFourGPUSystem(allocator *memoryAllocatorImpl) {

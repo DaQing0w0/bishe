@@ -207,11 +207,11 @@ func (a *memoryAllocatorImpl) RemovePage(vAddr uint64) {
 	a.removePage(vAddr)
 }
 
-func (a *memoryAllocatorImpl) removePage(vAddr uint64) {
+func (a *memoryAllocatorImpl) removePage(vAddr uint64) bool {
 	page, ok := a.vAddrToPageMapping[vAddr]
 
 	if !ok {
-		panic("page not found")
+		return false
 	}
 
 	deviceID := a.deviceIDByPAddr(page.PAddr)
@@ -219,6 +219,9 @@ func (a *memoryAllocatorImpl) removePage(vAddr uint64) {
 	dState.addSinglePAddr(page.PAddr)
 
 	a.pageTable.Remove(page.PID, page.VAddr)
+	delete(a.vAddrToPageMapping, page.VAddr)
+
+	return true
 }
 
 func (a *memoryAllocatorImpl) AllocatePageWithGivenVAddr(
