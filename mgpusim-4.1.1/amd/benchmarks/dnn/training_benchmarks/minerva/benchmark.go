@@ -32,8 +32,10 @@ type Benchmark struct {
 	EnableTesting      bool
 	EnableVerification bool
 
-	EnablePageAllocationTrace bool
-	PageAllocationTraceDir    string
+	EnablePageAllocationTrace   bool
+	PageAllocationTraceDir      string
+	EnableAutoPageReleaseDryRun bool
+	AutoPageReleaseDryRunDir    string
 }
 
 // NewBenchmark creates a new benchmark.
@@ -121,8 +123,10 @@ func (b *Benchmark) createTrainer() {
 		Contexts:         b.contexts,
 		Driver:           b.driver,
 
-		EnableEpochPageAllocTrace: b.EnablePageAllocationTrace,
-		PageAllocTraceDir:         b.PageAllocationTraceDir,
+		EnableEpochPageAllocTrace:   b.EnablePageAllocationTrace,
+		PageAllocTraceDir:           b.PageAllocationTraceDir,
+		EnableAutoPageReleaseDryRun: b.EnableAutoPageReleaseDryRun,
+		AutoPageReleaseDryRunDir:    b.AutoPageReleaseDryRunDir,
 	}
 }
 

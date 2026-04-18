@@ -85,6 +85,7 @@ func (t *addrSeqTracer) StartTask(task tracing.Task) {
 				pageSize = page.PageSize
 				pageDevice = page.DeviceID
 				found = true
+				t.pageFinder.ObservePageAccessForAutoRelease(pid, page.VAddr)
 			}
 		}
 

@@ -32,6 +32,8 @@ func main() {
 	benchmark.EnableVerification = *enableVerification
 	benchmark.EnablePageAllocationTrace = true
 	benchmark.PageAllocationTraceDir = "minerva_page_alloc_trace"
+	benchmark.EnableAutoPageReleaseDryRun = true
+	benchmark.AutoPageReleaseDryRunDir = "minerva_auto_release_dry_run"
 	runner.AddBenchmark(benchmark)
 
 	runner.Run()

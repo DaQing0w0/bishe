@@ -3,6 +3,7 @@ package driver
 import (
 	"encoding/csv"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,12 +29,24 @@ type epochPageAllocRecord struct {
 type epochPageAllocTracer struct {
 	mu sync.Mutex
 
-	outputDir      string
+	outputDir       string
+	allocTraceOn    bool
+	dryRunOn        bool
+	dryRunOutputDir string
+
 	nextSeqByEpoch map[int]uint64
 
 	activeEpochByPID map[vm.PID]int
 	activePIDCount   map[int]int
 	recordsByEpoch   map[int][]epochPageAllocRecord
+
+	seqByEpochPIDVAddr map[int]map[vm.PID]map[uint64]uint64
+	accessByEpochSeq   map[int]map[uint64]uint64
+	baselineBySeq      map[uint64]uint64
+
+	wouldReleaseByEpoch  map[int]map[uint64]bool
+	unknownSeqByEpoch    map[int]uint64
+	postThresholdByEpoch map[int]map[uint64]uint64
 }
 
 func newEpochPageAllocTracer(outputDir string) *epochPageAllocTracer {
@@ -42,12 +55,62 @@ func newEpochPageAllocTracer(outputDir string) *epochPageAllocTracer {
 	}
 
 	return &epochPageAllocTracer{
-		outputDir:        outputDir,
-		nextSeqByEpoch:   make(map[int]uint64),
-		activeEpochByPID: make(map[vm.PID]int),
-		activePIDCount:   make(map[int]int),
-		recordsByEpoch:   make(map[int][]epochPageAllocRecord),
+		outputDir:            outputDir,
+		allocTraceOn:         true,
+		nextSeqByEpoch:       make(map[int]uint64),
+		activeEpochByPID:     make(map[vm.PID]int),
+		activePIDCount:       make(map[int]int),
+		recordsByEpoch:       make(map[int][]epochPageAllocRecord),
+		seqByEpochPIDVAddr:   make(map[int]map[vm.PID]map[uint64]uint64),
+		accessByEpochSeq:     make(map[int]map[uint64]uint64),
+		baselineBySeq:        make(map[uint64]uint64),
+		wouldReleaseByEpoch:  make(map[int]map[uint64]bool),
+		unknownSeqByEpoch:    make(map[int]uint64),
+		postThresholdByEpoch: make(map[int]map[uint64]uint64),
 	}
+}
+
+func (t *epochPageAllocTracer) setAllocTraceOutputDir(outputDir string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if outputDir == "" {
+		outputDir = "page_alloc_trace"
+	}
+	t.outputDir = outputDir
+	t.allocTraceOn = true
+}
+
+func (t *epochPageAllocTracer) disableAllocTrace() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.allocTraceOn = false
+}
+
+func (t *epochPageAllocTracer) enableAutoReleaseDryRun(outputDir string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if outputDir == "" {
+		outputDir = "page_auto_release_dry_run"
+	}
+	t.dryRunOutputDir = outputDir
+	t.dryRunOn = true
+}
+
+func (t *epochPageAllocTracer) disableAutoReleaseDryRun() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.dryRunOn = false
+}
+
+func (t *epochPageAllocTracer) isIdle() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return !t.allocTraceOn && !t.dryRunOn
 }
 
 func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEvent) {
@@ -60,8 +123,17 @@ func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEven
 	}
 
 	t.nextSeqByEpoch[epoch]++
+	seq := t.nextSeqByEpoch[epoch]
+	if _, ok := t.seqByEpochPIDVAddr[epoch]; !ok {
+		t.seqByEpochPIDVAddr[epoch] = make(map[vm.PID]map[uint64]uint64)
+	}
+	if _, ok := t.seqByEpochPIDVAddr[epoch][event.PID]; !ok {
+		t.seqByEpochPIDVAddr[epoch][event.PID] = make(map[uint64]uint64)
+	}
+	t.seqByEpochPIDVAddr[epoch][event.PID][event.VAddr] = seq
+
 	t.recordsByEpoch[epoch] = append(t.recordsByEpoch[epoch], epochPageAllocRecord{
-		Seq:      t.nextSeqByEpoch[epoch],
+		Seq:      seq,
 		Epoch:    epoch,
 		PID:      event.PID,
 		Cause:    event.Cause,
@@ -71,6 +143,57 @@ func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEven
 		DeviceID: event.DeviceID,
 		Unified:  event.Unified,
 	})
+}
+
+func (t *epochPageAllocTracer) OnPageAccess(pid vm.PID, pageVAddr uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	epoch, found := t.activeEpochByPID[pid]
+	if !found {
+		return
+	}
+
+	pidMap, ok := t.seqByEpochPIDVAddr[epoch][pid]
+	if !ok {
+		return
+	}
+
+	seq, ok := pidMap[pageVAddr]
+	if !ok {
+		return
+	}
+
+	if _, ok := t.accessByEpochSeq[epoch]; !ok {
+		t.accessByEpochSeq[epoch] = make(map[uint64]uint64)
+	}
+	t.accessByEpochSeq[epoch][seq]++
+
+	if !t.dryRunOn || epoch < 2 {
+		return
+	}
+
+	baseline, ok := t.baselineBySeq[seq]
+	if !ok {
+		t.unknownSeqByEpoch[epoch]++
+		return
+	}
+
+	current := t.accessByEpochSeq[epoch][seq]
+	if current == baseline {
+		if _, ok := t.wouldReleaseByEpoch[epoch]; !ok {
+			t.wouldReleaseByEpoch[epoch] = make(map[uint64]bool)
+		}
+		t.wouldReleaseByEpoch[epoch][seq] = true
+		return
+	}
+
+	if current > baseline {
+		if _, ok := t.postThresholdByEpoch[epoch]; !ok {
+			t.postThresholdByEpoch[epoch] = make(map[uint64]uint64)
+		}
+		t.postThresholdByEpoch[epoch][seq]++
+	}
 }
 
 func (t *epochPageAllocTracer) beginEpochForPID(pid vm.PID, epoch int) {
@@ -110,9 +233,43 @@ func (t *epochPageAllocTracer) endEpochForPID(pid vm.PID) (epoch int, shouldFlus
 func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 	t.mu.Lock()
 	records := append([]epochPageAllocRecord(nil), t.recordsByEpoch[epoch]...)
+	accessBySeq := make(map[uint64]uint64)
+	for seq, c := range t.accessByEpochSeq[epoch] {
+		accessBySeq[seq] = c
+	}
+	wouldRelease := make(map[uint64]bool)
+	for seq, v := range t.wouldReleaseByEpoch[epoch] {
+		wouldRelease[seq] = v
+	}
+	postThreshold := make(map[uint64]uint64)
+	for seq, c := range t.postThresholdByEpoch[epoch] {
+		postThreshold[seq] = c
+	}
+	unknownSeq := t.unknownSeqByEpoch[epoch]
+	baselineBySeq := make(map[uint64]uint64)
+	for seq, c := range t.baselineBySeq {
+		baselineBySeq[seq] = c
+	}
+	allocTraceOn := t.allocTraceOn
+	dryRunOn := t.dryRunOn
+	allocOutDir := t.outputDir
+	dryRunOutDir := t.dryRunOutputDir
+
 	delete(t.recordsByEpoch, epoch)
 	delete(t.nextSeqByEpoch, epoch)
-	outDir := t.outputDir
+	delete(t.seqByEpochPIDVAddr, epoch)
+	delete(t.accessByEpochSeq, epoch)
+	delete(t.wouldReleaseByEpoch, epoch)
+	delete(t.postThresholdByEpoch, epoch)
+	delete(t.unknownSeqByEpoch, epoch)
+
+	if epoch == 1 {
+		t.baselineBySeq = make(map[uint64]uint64)
+		for seq, c := range accessBySeq {
+			t.baselineBySeq[seq] = c
+		}
+	}
+
 	t.mu.Unlock()
 
 	if len(records) == 0 {
@@ -123,52 +280,103 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 		return records[i].Seq < records[j].Seq
 	})
 
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return err
-	}
+	if allocTraceOn {
+		if err := os.MkdirAll(allocOutDir, 0o755); err != nil {
+			return err
+		}
 
-	filePath := filepath.Join(outDir, fmt.Sprintf("epoch_%04d_page_alloc.csv", epoch))
-	f, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+		filePath := filepath.Join(allocOutDir, fmt.Sprintf("epoch_%04d_page_alloc.csv", epoch))
+		f, err := os.Create(filePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
 
-	w := csv.NewWriter(f)
-	defer w.Flush()
+		w := csv.NewWriter(f)
+		defer w.Flush()
 
-	if err := w.Write([]string{
-		"seq",
-		"epoch",
-		"pid",
-		"cause",
-		"vaddr_hex",
-		"paddr_hex",
-		"page_size",
-		"device_id",
-		"unified",
-	}); err != nil {
-		return err
-	}
-
-	for _, r := range records {
 		if err := w.Write([]string{
-			strconv.FormatUint(r.Seq, 10),
-			strconv.Itoa(r.Epoch),
-			strconv.FormatUint(uint64(r.PID), 10),
-			r.Cause,
-			fmt.Sprintf("0x%x", r.VAddr),
-			fmt.Sprintf("0x%x", r.PAddr),
-			strconv.FormatUint(r.PageSize, 10),
-			strconv.FormatUint(r.DeviceID, 10),
-			strconv.FormatBool(r.Unified),
+			"seq",
+			"epoch",
+			"pid",
+			"cause",
+			"vaddr_hex",
+			"paddr_hex",
+			"page_size",
+			"device_id",
+			"unified",
 		}); err != nil {
+			return err
+		}
+
+		for _, r := range records {
+			if err := w.Write([]string{
+				strconv.FormatUint(r.Seq, 10),
+				strconv.Itoa(r.Epoch),
+				strconv.FormatUint(uint64(r.PID), 10),
+				r.Cause,
+				fmt.Sprintf("0x%x", r.VAddr),
+				fmt.Sprintf("0x%x", r.PAddr),
+				strconv.FormatUint(r.PageSize, 10),
+				strconv.FormatUint(r.DeviceID, 10),
+				strconv.FormatBool(r.Unified),
+			}); err != nil {
+				return err
+			}
+		}
+
+		if err := w.Error(); err != nil {
 			return err
 		}
 	}
 
-	if err := w.Error(); err != nil {
-		return err
+	if dryRunOn && epoch >= 2 {
+		if err := os.MkdirAll(dryRunOutDir, 0o755); err != nil {
+			return err
+		}
+
+		filePath := filepath.Join(dryRunOutDir, fmt.Sprintf("epoch_%04d_auto_release_dry_run.csv", epoch))
+		f, err := os.Create(filePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		w := csv.NewWriter(f)
+		defer w.Flush()
+
+		if err := w.Write([]string{
+			"seq",
+			"epoch",
+			"baseline_access",
+			"current_access",
+			"would_release",
+			"post_threshold_access",
+		}); err != nil {
+			return err
+		}
+
+		for _, r := range records {
+			baseline := baselineBySeq[r.Seq]
+			current := accessBySeq[r.Seq]
+			post := postThreshold[r.Seq]
+			if err := w.Write([]string{
+				strconv.FormatUint(r.Seq, 10),
+				strconv.Itoa(epoch),
+				strconv.FormatUint(baseline, 10),
+				strconv.FormatUint(current, 10),
+				strconv.FormatBool(wouldRelease[r.Seq]),
+				strconv.FormatUint(post, 10),
+			}); err != nil {
+				return err
+			}
+		}
+
+		if err := w.Error(); err != nil {
+			return err
+		}
+
+		log.Printf("[auto-release-dry-run] epoch=%d would_release=%d unknown_seq_access=%d", epoch, len(wouldRelease), unknownSeq)
 	}
 
 	return nil
@@ -192,15 +400,58 @@ func uniquePIDs(contexts []*Context) []vm.PID {
 
 // EnableEpochPageAllocationTrace enables page-allocation tracing and CSV export.
 func (d *Driver) EnableEpochPageAllocationTrace(outputDir string) {
-	tracer := newEpochPageAllocTracer(outputDir)
-	d.pageAllocTracer = tracer
-	internal.SetPageAllocationObserver(tracer)
+	if d.pageAllocTracer == nil {
+		d.pageAllocTracer = newEpochPageAllocTracer(outputDir)
+		internal.SetPageAllocationObserver(d.pageAllocTracer)
+		return
+	}
+
+	d.pageAllocTracer.setAllocTraceOutputDir(outputDir)
 }
 
 // DisableEpochPageAllocationTrace disables page-allocation tracing.
 func (d *Driver) DisableEpochPageAllocationTrace() {
-	d.pageAllocTracer = nil
-	internal.SetPageAllocationObserver(nil)
+	if d.pageAllocTracer == nil {
+		return
+	}
+
+	d.pageAllocTracer.disableAllocTrace()
+	if d.pageAllocTracer.isIdle() {
+		d.pageAllocTracer = nil
+		internal.SetPageAllocationObserver(nil)
+	}
+}
+
+// EnableAutoPageReleaseDryRun enables online auto-release decision dry-run.
+func (d *Driver) EnableAutoPageReleaseDryRun(outputDir string) {
+	if d.pageAllocTracer == nil {
+		d.pageAllocTracer = newEpochPageAllocTracer("")
+		internal.SetPageAllocationObserver(d.pageAllocTracer)
+	}
+
+	d.pageAllocTracer.enableAutoReleaseDryRun(outputDir)
+}
+
+// DisableAutoPageReleaseDryRun disables online auto-release decision dry-run.
+func (d *Driver) DisableAutoPageReleaseDryRun() {
+	if d.pageAllocTracer == nil {
+		return
+	}
+
+	d.pageAllocTracer.disableAutoReleaseDryRun()
+	if d.pageAllocTracer.isIdle() {
+		d.pageAllocTracer = nil
+		internal.SetPageAllocationObserver(nil)
+	}
+}
+
+// ObservePageAccessForAutoRelease accepts per-page access events for dry-run.
+func (d *Driver) ObservePageAccessForAutoRelease(pid vm.PID, pageVAddr uint64) {
+	if d.pageAllocTracer == nil {
+		return
+	}
+
+	d.pageAllocTracer.OnPageAccess(pid, pageVAddr)
 }
 
 // BeginEpochPageAllocationTrace marks epoch start for all provided contexts.

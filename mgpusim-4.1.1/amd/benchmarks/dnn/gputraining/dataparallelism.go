@@ -32,8 +32,10 @@ type DataParallelismMultiGPUTrainer struct {
 	Contexts         []*driver.Context
 	Driver           *driver.Driver
 
-	EnableEpochPageAllocTrace bool
-	PageAllocTraceDir         string
+	EnableEpochPageAllocTrace   bool
+	PageAllocTraceDir           string
+	EnableAutoPageReleaseDryRun bool
+	AutoPageReleaseDryRunDir    string
 
 	currentEpoch int
 }
@@ -48,6 +50,11 @@ func (t *DataParallelismMultiGPUTrainer) Train() {
 	if t.EnableEpochPageAllocTrace {
 		t.Driver.EnableEpochPageAllocationTrace(t.PageAllocTraceDir)
 		defer t.Driver.DisableEpochPageAllocationTrace()
+	}
+
+	if t.EnableAutoPageReleaseDryRun {
+		t.Driver.EnableAutoPageReleaseDryRun(t.AutoPageReleaseDryRunDir)
+		defer t.Driver.DisableAutoPageReleaseDryRun()
 	}
 
 	for currentEpoch := 0; currentEpoch < t.Epoch; currentEpoch++ {
