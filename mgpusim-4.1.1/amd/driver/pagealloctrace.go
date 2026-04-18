@@ -29,10 +29,13 @@ type epochPageAllocRecord struct {
 type epochPageAllocTracer struct {
 	mu sync.Mutex
 
-	outputDir       string
-	allocTraceOn    bool
-	dryRunOn        bool
-	dryRunOutputDir string
+	outputDir        string
+	allocTraceOn     bool
+	dryRunOn         bool
+	dryRunOutputDir  string
+	enforceOn        bool
+	enforceOutputDir string
+	releasePage      func(vAddr uint64)
 
 	nextSeqByEpoch map[int]uint64
 
@@ -49,7 +52,7 @@ type epochPageAllocTracer struct {
 	postThresholdByEpoch map[int]map[uint64]uint64
 }
 
-func newEpochPageAllocTracer(outputDir string) *epochPageAllocTracer {
+func newEpochPageAllocTracer(outputDir string, releasePage func(vAddr uint64)) *epochPageAllocTracer {
 	if outputDir == "" {
 		outputDir = "page_alloc_trace"
 	}
@@ -57,6 +60,7 @@ func newEpochPageAllocTracer(outputDir string) *epochPageAllocTracer {
 	return &epochPageAllocTracer{
 		outputDir:            outputDir,
 		allocTraceOn:         true,
+		releasePage:          releasePage,
 		nextSeqByEpoch:       make(map[int]uint64),
 		activeEpochByPID:     make(map[vm.PID]int),
 		activePIDCount:       make(map[int]int),
@@ -106,11 +110,29 @@ func (t *epochPageAllocTracer) disableAutoReleaseDryRun() {
 	t.dryRunOn = false
 }
 
+func (t *epochPageAllocTracer) enableAutoReleaseEnforce(outputDir string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if outputDir == "" {
+		outputDir = "page_auto_release_enforce"
+	}
+	t.enforceOutputDir = outputDir
+	t.enforceOn = true
+}
+
+func (t *epochPageAllocTracer) disableAutoReleaseEnforce() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.enforceOn = false
+}
+
 func (t *epochPageAllocTracer) isIdle() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	return !t.allocTraceOn && !t.dryRunOn
+	return !t.allocTraceOn && !t.dryRunOn && !t.enforceOn
 }
 
 func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEvent) {
@@ -169,7 +191,7 @@ func (t *epochPageAllocTracer) OnPageAccess(pid vm.PID, pageVAddr uint64) {
 	}
 	t.accessByEpochSeq[epoch][seq]++
 
-	if !t.dryRunOn || epoch < 2 {
+	if epoch < 2 {
 		return
 	}
 
@@ -184,7 +206,13 @@ func (t *epochPageAllocTracer) OnPageAccess(pid vm.PID, pageVAddr uint64) {
 		if _, ok := t.wouldReleaseByEpoch[epoch]; !ok {
 			t.wouldReleaseByEpoch[epoch] = make(map[uint64]bool)
 		}
-		t.wouldReleaseByEpoch[epoch][seq] = true
+		if baseline > 0 {
+			t.wouldReleaseByEpoch[epoch][seq] = true
+		}
+
+		if !t.dryRunOn {
+			return
+		}
 		return
 	}
 
@@ -241,6 +269,7 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 	for seq, v := range t.wouldReleaseByEpoch[epoch] {
 		wouldRelease[seq] = v
 	}
+	released := make(map[uint64]bool)
 	postThreshold := make(map[uint64]uint64)
 	for seq, c := range t.postThresholdByEpoch[epoch] {
 		postThreshold[seq] = c
@@ -252,8 +281,10 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 	}
 	allocTraceOn := t.allocTraceOn
 	dryRunOn := t.dryRunOn
+	enforceOn := t.enforceOn
 	allocOutDir := t.outputDir
 	dryRunOutDir := t.dryRunOutputDir
+	enforceOutDir := t.enforceOutputDir
 
 	delete(t.recordsByEpoch, epoch)
 	delete(t.nextSeqByEpoch, epoch)
@@ -379,6 +410,72 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 		log.Printf("[auto-release-dry-run] epoch=%d would_release=%d unknown_seq_access=%d", epoch, len(wouldRelease), unknownSeq)
 	}
 
+	if enforceOn && epoch >= 2 {
+		for _, r := range records {
+			baseline := baselineBySeq[r.Seq]
+			current := accessBySeq[r.Seq]
+			post := postThreshold[r.Seq]
+
+			if baseline == 0 || !wouldRelease[r.Seq] || post > 0 || current != baseline {
+				continue
+			}
+
+			if t.releasePage != nil {
+				t.releasePage(r.VAddr)
+				released[r.Seq] = true
+			}
+		}
+
+		if err := os.MkdirAll(enforceOutDir, 0o755); err != nil {
+			return err
+		}
+
+		filePath := filepath.Join(enforceOutDir, fmt.Sprintf("epoch_%04d_auto_release_enforce.csv", epoch))
+		f, err := os.Create(filePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		w := csv.NewWriter(f)
+		defer w.Flush()
+
+		if err := w.Write([]string{
+			"seq",
+			"epoch",
+			"baseline_access",
+			"current_access",
+			"would_release",
+			"did_release",
+			"post_threshold_access",
+		}); err != nil {
+			return err
+		}
+
+		for _, r := range records {
+			baseline := baselineBySeq[r.Seq]
+			current := accessBySeq[r.Seq]
+			post := postThreshold[r.Seq]
+			if err := w.Write([]string{
+				strconv.FormatUint(r.Seq, 10),
+				strconv.Itoa(epoch),
+				strconv.FormatUint(baseline, 10),
+				strconv.FormatUint(current, 10),
+				strconv.FormatBool(wouldRelease[r.Seq]),
+				strconv.FormatBool(released[r.Seq]),
+				strconv.FormatUint(post, 10),
+			}); err != nil {
+				return err
+			}
+		}
+
+		if err := w.Error(); err != nil {
+			return err
+		}
+
+		log.Printf("[auto-release-enforce] epoch=%d released=%d unknown_seq_access=%d", epoch, len(released), unknownSeq)
+	}
+
 	return nil
 }
 
@@ -401,7 +498,7 @@ func uniquePIDs(contexts []*Context) []vm.PID {
 // EnableEpochPageAllocationTrace enables page-allocation tracing and CSV export.
 func (d *Driver) EnableEpochPageAllocationTrace(outputDir string) {
 	if d.pageAllocTracer == nil {
-		d.pageAllocTracer = newEpochPageAllocTracer(outputDir)
+		d.pageAllocTracer = newEpochPageAllocTracer(outputDir, d.memAllocator.RemovePage)
 		internal.SetPageAllocationObserver(d.pageAllocTracer)
 		return
 	}
@@ -425,7 +522,7 @@ func (d *Driver) DisableEpochPageAllocationTrace() {
 // EnableAutoPageReleaseDryRun enables online auto-release decision dry-run.
 func (d *Driver) EnableAutoPageReleaseDryRun(outputDir string) {
 	if d.pageAllocTracer == nil {
-		d.pageAllocTracer = newEpochPageAllocTracer("")
+		d.pageAllocTracer = newEpochPageAllocTracer("", d.memAllocator.RemovePage)
 		internal.SetPageAllocationObserver(d.pageAllocTracer)
 	}
 
@@ -445,7 +542,30 @@ func (d *Driver) DisableAutoPageReleaseDryRun() {
 	}
 }
 
-// ObservePageAccessForAutoRelease accepts per-page access events for dry-run.
+// EnableAutoPageReleaseEnforce enables online threshold-based page release.
+func (d *Driver) EnableAutoPageReleaseEnforce(outputDir string) {
+	if d.pageAllocTracer == nil {
+		d.pageAllocTracer = newEpochPageAllocTracer("", d.memAllocator.RemovePage)
+		internal.SetPageAllocationObserver(d.pageAllocTracer)
+	}
+
+	d.pageAllocTracer.enableAutoReleaseEnforce(outputDir)
+}
+
+// DisableAutoPageReleaseEnforce disables online threshold-based page release.
+func (d *Driver) DisableAutoPageReleaseEnforce() {
+	if d.pageAllocTracer == nil {
+		return
+	}
+
+	d.pageAllocTracer.disableAutoReleaseEnforce()
+	if d.pageAllocTracer.isIdle() {
+		d.pageAllocTracer = nil
+		internal.SetPageAllocationObserver(nil)
+	}
+}
+
+// ObservePageAccessForAutoRelease accepts per-page access events for auto-release modes.
 func (d *Driver) ObservePageAccessForAutoRelease(pid vm.PID, pageVAddr uint64) {
 	if d.pageAllocTracer == nil {
 		return
