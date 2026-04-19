@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/sarchlab/akita/v4/mem/vm"
+	"github.com/sarchlab/akita/v4/sim"
 	"github.com/sarchlab/mgpusim/v4/amd/driver/internal"
 )
 
@@ -26,16 +27,22 @@ type epochPageAllocRecord struct {
 	Unified  bool
 }
 
+type pendingPageRelease struct {
+	VAddr     uint64
+	ReleaseAt sim.VTimeInSec
+}
+
 type epochPageAllocTracer struct {
 	mu sync.Mutex
 
-	outputDir        string
-	allocTraceOn     bool
-	dryRunOn         bool
-	dryRunOutputDir  string
-	enforceOn        bool
-	enforceOutputDir string
-	releasePage      func(vAddr uint64)
+	outputDir           string
+	allocTraceOn        bool
+	dryRunOn            bool
+	dryRunOutputDir     string
+	enforceOn           bool
+	enforceOutputDir    string
+	enforceReleaseDelay sim.VTimeInSec
+	releasePage         func(vAddr uint64)
 
 	nextSeqByEpoch map[int]uint64
 
@@ -43,13 +50,17 @@ type epochPageAllocTracer struct {
 	activePIDCount   map[int]int
 	recordsByEpoch   map[int][]epochPageAllocRecord
 
-	seqByEpochPIDVAddr map[int]map[vm.PID]map[uint64]uint64
-	accessByEpochSeq   map[int]map[uint64]uint64
-	baselineBySeq      map[uint64]uint64
+	seqByEpochPIDVAddr    map[int]map[vm.PID]map[uint64]uint64
+	accessByEpochSeq      map[int]map[uint64]uint64
+	allocTimeByEpochSeq   map[int]map[uint64]sim.VTimeInSec
+	epochStartTimeByEpoch map[int]sim.VTimeInSec
+	baselineBySeq         map[uint64]uint64
 
-	wouldReleaseByEpoch  map[int]map[uint64]bool
-	unknownSeqByEpoch    map[int]uint64
-	postThresholdByEpoch map[int]map[uint64]uint64
+	wouldReleaseByEpoch    map[int]map[uint64]bool
+	pendingReleaseByEpoch  map[int]map[uint64]pendingPageRelease
+	releasedTimeByEpochSeq map[int]map[uint64]sim.VTimeInSec
+	unknownSeqByEpoch      map[int]uint64
+	postThresholdByEpoch   map[int]map[uint64]uint64
 }
 
 func newEpochPageAllocTracer(outputDir string, releasePage func(vAddr uint64)) *epochPageAllocTracer {
@@ -58,19 +69,24 @@ func newEpochPageAllocTracer(outputDir string, releasePage func(vAddr uint64)) *
 	}
 
 	return &epochPageAllocTracer{
-		outputDir:            outputDir,
-		allocTraceOn:         true,
-		releasePage:          releasePage,
-		nextSeqByEpoch:       make(map[int]uint64),
-		activeEpochByPID:     make(map[vm.PID]int),
-		activePIDCount:       make(map[int]int),
-		recordsByEpoch:       make(map[int][]epochPageAllocRecord),
-		seqByEpochPIDVAddr:   make(map[int]map[vm.PID]map[uint64]uint64),
-		accessByEpochSeq:     make(map[int]map[uint64]uint64),
-		baselineBySeq:        make(map[uint64]uint64),
-		wouldReleaseByEpoch:  make(map[int]map[uint64]bool),
-		unknownSeqByEpoch:    make(map[int]uint64),
-		postThresholdByEpoch: make(map[int]map[uint64]uint64),
+		outputDir:              outputDir,
+		allocTraceOn:           true,
+		enforceReleaseDelay:    sim.VTimeInSec(1e-6),
+		releasePage:            releasePage,
+		nextSeqByEpoch:         make(map[int]uint64),
+		activeEpochByPID:       make(map[vm.PID]int),
+		activePIDCount:         make(map[int]int),
+		recordsByEpoch:         make(map[int][]epochPageAllocRecord),
+		seqByEpochPIDVAddr:     make(map[int]map[vm.PID]map[uint64]uint64),
+		accessByEpochSeq:       make(map[int]map[uint64]uint64),
+		allocTimeByEpochSeq:    make(map[int]map[uint64]sim.VTimeInSec),
+		epochStartTimeByEpoch:  make(map[int]sim.VTimeInSec),
+		baselineBySeq:          make(map[uint64]uint64),
+		wouldReleaseByEpoch:    make(map[int]map[uint64]bool),
+		pendingReleaseByEpoch:  make(map[int]map[uint64]pendingPageRelease),
+		releasedTimeByEpochSeq: make(map[int]map[uint64]sim.VTimeInSec),
+		unknownSeqByEpoch:      make(map[int]uint64),
+		postThresholdByEpoch:   make(map[int]map[uint64]uint64),
 	}
 }
 
@@ -135,6 +151,52 @@ func (t *epochPageAllocTracer) isIdle() bool {
 	return !t.allocTraceOn && !t.dryRunOn && !t.enforceOn
 }
 
+func (t *epochPageAllocTracer) processDueReleases(now sim.VTimeInSec) bool {
+	t.mu.Lock()
+	if !t.enforceOn || t.releasePage == nil {
+		t.mu.Unlock()
+		return false
+	}
+
+	type releaseItem struct {
+		epoch int
+		seq   uint64
+		vAddr uint64
+	}
+	releases := make([]releaseItem, 0)
+
+	for epoch, pendingBySeq := range t.pendingReleaseByEpoch {
+		for seq, pending := range pendingBySeq {
+			if now < pending.ReleaseAt {
+				continue
+			}
+
+			if _, ok := t.releasedTimeByEpochSeq[epoch]; !ok {
+				t.releasedTimeByEpochSeq[epoch] = make(map[uint64]sim.VTimeInSec)
+			}
+			if _, alreadyReleased := t.releasedTimeByEpochSeq[epoch][seq]; alreadyReleased {
+				delete(pendingBySeq, seq)
+				continue
+			}
+
+			t.releasedTimeByEpochSeq[epoch][seq] = now
+			releases = append(releases, releaseItem{epoch: epoch, seq: seq, vAddr: pending.VAddr})
+			delete(pendingBySeq, seq)
+		}
+
+		if len(pendingBySeq) == 0 {
+			delete(t.pendingReleaseByEpoch, epoch)
+		}
+	}
+	t.mu.Unlock()
+
+	for _, r := range releases {
+		t.releasePage(r.vAddr)
+	}
+
+	return len(releases) > 0
+}
+
 func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -154,6 +216,11 @@ func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEven
 	}
 	t.seqByEpochPIDVAddr[epoch][event.PID][event.VAddr] = seq
 
+	if _, ok := t.allocTimeByEpochSeq[epoch]; !ok {
+		t.allocTimeByEpochSeq[epoch] = make(map[uint64]sim.VTimeInSec)
+	}
+	t.allocTimeByEpochSeq[epoch][seq] = event.Time
+
 	t.recordsByEpoch[epoch] = append(t.recordsByEpoch[epoch], epochPageAllocRecord{
 		Seq:      seq,
 		Epoch:    epoch,
@@ -167,7 +234,7 @@ func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEven
 	})
 }
 
-func (t *epochPageAllocTracer) OnPageAccess(pid vm.PID, pageVAddr uint64) {
+func (t *epochPageAllocTracer) OnPageAccess(pid vm.PID, pageVAddr uint64, now sim.VTimeInSec) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -208,6 +275,23 @@ func (t *epochPageAllocTracer) OnPageAccess(pid vm.PID, pageVAddr uint64) {
 		}
 		if baseline > 0 {
 			t.wouldReleaseByEpoch[epoch][seq] = true
+
+			if t.enforceOn {
+				if _, ok := t.releasedTimeByEpochSeq[epoch]; !ok {
+					t.releasedTimeByEpochSeq[epoch] = make(map[uint64]sim.VTimeInSec)
+				}
+				if _, released := t.releasedTimeByEpochSeq[epoch][seq]; !released {
+					if _, ok := t.pendingReleaseByEpoch[epoch]; !ok {
+						t.pendingReleaseByEpoch[epoch] = make(map[uint64]pendingPageRelease)
+					}
+					if _, pending := t.pendingReleaseByEpoch[epoch][seq]; !pending {
+						t.pendingReleaseByEpoch[epoch][seq] = pendingPageRelease{
+							VAddr:     pageVAddr,
+							ReleaseAt: now + t.enforceReleaseDelay,
+						}
+					}
+				}
+			}
 		}
 
 		if !t.dryRunOn {
@@ -221,10 +305,13 @@ func (t *epochPageAllocTracer) OnPageAccess(pid vm.PID, pageVAddr uint64) {
 			t.postThresholdByEpoch[epoch] = make(map[uint64]uint64)
 		}
 		t.postThresholdByEpoch[epoch][seq]++
+		if pendingBySeq, ok := t.pendingReleaseByEpoch[epoch]; ok {
+			delete(pendingBySeq, seq)
+		}
 	}
 }
 
-func (t *epochPageAllocTracer) beginEpochForPID(pid vm.PID, epoch int) {
+func (t *epochPageAllocTracer) beginEpochForPID(pid vm.PID, epoch int, now sim.VTimeInSec) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -237,39 +324,58 @@ func (t *epochPageAllocTracer) beginEpochForPID(pid vm.PID, epoch int) {
 
 	t.activeEpochByPID[pid] = epoch
 	t.activePIDCount[epoch]++
+	if _, found := t.epochStartTimeByEpoch[epoch]; !found {
+		t.epochStartTimeByEpoch[epoch] = now
+	}
 }
 
-func (t *epochPageAllocTracer) endEpochForPID(pid vm.PID) (epoch int, shouldFlush bool) {
+func (t *epochPageAllocTracer) endEpochForPID(pid vm.PID, now sim.VTimeInSec) (
+	epoch int,
+	shouldFlush bool,
+	epochEndTime sim.VTimeInSec,
+) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	epoch, found := t.activeEpochByPID[pid]
 	if !found {
-		return -1, false
+		return -1, false, 0
 	}
 
 	delete(t.activeEpochByPID, pid)
 	t.activePIDCount[epoch]--
 	if t.activePIDCount[epoch] > 0 {
-		return epoch, false
+		return epoch, false, 0
 	}
 
 	delete(t.activePIDCount, epoch)
-	return epoch, true
+	return epoch, true, now
 }
 
-func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
+func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec) error {
 	t.mu.Lock()
 	records := append([]epochPageAllocRecord(nil), t.recordsByEpoch[epoch]...)
 	accessBySeq := make(map[uint64]uint64)
 	for seq, c := range t.accessByEpochSeq[epoch] {
 		accessBySeq[seq] = c
 	}
+	allocTimeBySeq := make(map[uint64]sim.VTimeInSec)
+	for seq, tm := range t.allocTimeByEpochSeq[epoch] {
+		allocTimeBySeq[seq] = tm
+	}
+	epochStartTime := t.epochStartTimeByEpoch[epoch]
 	wouldRelease := make(map[uint64]bool)
 	for seq, v := range t.wouldReleaseByEpoch[epoch] {
 		wouldRelease[seq] = v
 	}
+	releasedTimeBySeq := make(map[uint64]sim.VTimeInSec)
+	for seq, tm := range t.releasedTimeByEpochSeq[epoch] {
+		releasedTimeBySeq[seq] = tm
+	}
 	released := make(map[uint64]bool)
+	for seq := range releasedTimeBySeq {
+		released[seq] = true
+	}
 	postThreshold := make(map[uint64]uint64)
 	for seq, c := range t.postThresholdByEpoch[epoch] {
 		postThreshold[seq] = c
@@ -290,7 +396,11 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 	delete(t.nextSeqByEpoch, epoch)
 	delete(t.seqByEpochPIDVAddr, epoch)
 	delete(t.accessByEpochSeq, epoch)
+	delete(t.allocTimeByEpochSeq, epoch)
+	delete(t.epochStartTimeByEpoch, epoch)
 	delete(t.wouldReleaseByEpoch, epoch)
+	delete(t.pendingReleaseByEpoch, epoch)
+	delete(t.releasedTimeByEpochSeq, epoch)
 	delete(t.postThresholdByEpoch, epoch)
 	delete(t.unknownSeqByEpoch, epoch)
 
@@ -327,15 +437,7 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 		defer w.Flush()
 
 		if err := w.Write([]string{
-			"seq",
-			"epoch",
-			"pid",
-			"cause",
-			"vaddr_hex",
-			"paddr_hex",
-			"page_size",
-			"device_id",
-			"unified",
+			"seq", "epoch", "pid", "cause", "vaddr_hex", "paddr_hex", "page_size", "device_id", "unified",
 		}); err != nil {
 			return err
 		}
@@ -377,20 +479,36 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 		defer w.Flush()
 
 		if err := w.Write([]string{
-			"seq",
-			"epoch",
-			"baseline_access",
-			"current_access",
-			"would_release",
-			"post_threshold_access",
+			"seq", "epoch", "baseline_access", "current_access", "would_release", "post_threshold_access",
+			"alloc_time", "candidate_release_time", "candidate_lifetime", "epoch_runtime", "candidate_lifetime_epoch_runtime_ratio",
 		}); err != nil {
 			return err
 		}
+
+		epochRuntime := epochEndTime - epochStartTime
+		epochRuntimeStr := strconv.FormatFloat(float64(epochRuntime), 'f', 12, 64)
 
 		for _, r := range records {
 			baseline := baselineBySeq[r.Seq]
 			current := accessBySeq[r.Seq]
 			post := postThreshold[r.Seq]
+			allocTime := allocTimeBySeq[r.Seq]
+			allocTimeStr := strconv.FormatFloat(float64(allocTime), 'f', 12, 64)
+
+			candidateReleaseTimeStr := ""
+			candidateLifetimeStr := ""
+			candidateRatioStr := ""
+			if wouldRelease[r.Seq] {
+				candidateReleaseTime := epochEndTime
+				candidateLifetime := candidateReleaseTime - allocTime
+				candidateReleaseTimeStr = strconv.FormatFloat(float64(candidateReleaseTime), 'f', 12, 64)
+				candidateLifetimeStr = strconv.FormatFloat(float64(candidateLifetime), 'f', 12, 64)
+				if epochRuntime > 0 {
+					candidateRatio := float64(candidateLifetime) / float64(epochRuntime)
+					candidateRatioStr = strconv.FormatFloat(candidateRatio, 'f', 12, 64)
+				}
+			}
+
 			if err := w.Write([]string{
 				strconv.FormatUint(r.Seq, 10),
 				strconv.Itoa(epoch),
@@ -398,6 +516,11 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 				strconv.FormatUint(current, 10),
 				strconv.FormatBool(wouldRelease[r.Seq]),
 				strconv.FormatUint(post, 10),
+				allocTimeStr,
+				candidateReleaseTimeStr,
+				candidateLifetimeStr,
+				epochRuntimeStr,
+				candidateRatioStr,
 			}); err != nil {
 				return err
 			}
@@ -416,13 +539,14 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 			current := accessBySeq[r.Seq]
 			post := postThreshold[r.Seq]
 
-			if baseline == 0 || !wouldRelease[r.Seq] || post > 0 || current != baseline {
+			if baseline == 0 || !wouldRelease[r.Seq] || post > 0 || current != baseline || released[r.Seq] {
 				continue
 			}
 
 			if t.releasePage != nil {
 				t.releasePage(r.VAddr)
 				released[r.Seq] = true
+				releasedTimeBySeq[r.Seq] = epochEndTime
 			}
 		}
 
@@ -441,21 +565,36 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 		defer w.Flush()
 
 		if err := w.Write([]string{
-			"seq",
-			"epoch",
-			"baseline_access",
-			"current_access",
-			"would_release",
-			"did_release",
-			"post_threshold_access",
+			"seq", "epoch", "baseline_access", "current_access", "would_release", "did_release", "post_threshold_access",
+			"alloc_time", "release_time", "lifetime", "epoch_runtime", "lifetime_epoch_runtime_ratio",
 		}); err != nil {
 			return err
 		}
+
+		epochRuntime := epochEndTime - epochStartTime
+		epochRuntimeStr := strconv.FormatFloat(float64(epochRuntime), 'f', 12, 64)
 
 		for _, r := range records {
 			baseline := baselineBySeq[r.Seq]
 			current := accessBySeq[r.Seq]
 			post := postThreshold[r.Seq]
+			allocTime := allocTimeBySeq[r.Seq]
+			allocTimeStr := strconv.FormatFloat(float64(allocTime), 'f', 12, 64)
+
+			releaseTimeStr := ""
+			lifetimeStr := ""
+			ratioStr := ""
+			if released[r.Seq] {
+				releaseTime := releasedTimeBySeq[r.Seq]
+				lifetime := releaseTime - allocTime
+				releaseTimeStr = strconv.FormatFloat(float64(releaseTime), 'f', 12, 64)
+				lifetimeStr = strconv.FormatFloat(float64(lifetime), 'f', 12, 64)
+				if epochRuntime > 0 {
+					ratio := float64(lifetime) / float64(epochRuntime)
+					ratioStr = strconv.FormatFloat(ratio, 'f', 12, 64)
+				}
+			}
+
 			if err := w.Write([]string{
 				strconv.FormatUint(r.Seq, 10),
 				strconv.Itoa(epoch),
@@ -464,6 +603,11 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int) error {
 				strconv.FormatBool(wouldRelease[r.Seq]),
 				strconv.FormatBool(released[r.Seq]),
 				strconv.FormatUint(post, 10),
+				allocTimeStr,
+				releaseTimeStr,
+				lifetimeStr,
+				epochRuntimeStr,
+				ratioStr,
 			}); err != nil {
 				return err
 			}
@@ -500,6 +644,9 @@ func (d *Driver) EnableEpochPageAllocationTrace(outputDir string) {
 	if d.pageAllocTracer == nil {
 		d.pageAllocTracer = newEpochPageAllocTracer(outputDir, d.memAllocator.RemovePage)
 		internal.SetPageAllocationObserver(d.pageAllocTracer)
+		internal.SetPageAllocationTimeSource(func() sim.VTimeInSec {
+			return d.Engine.CurrentTime()
+		})
 		return
 	}
 
@@ -516,6 +663,7 @@ func (d *Driver) DisableEpochPageAllocationTrace() {
 	if d.pageAllocTracer.isIdle() {
 		d.pageAllocTracer = nil
 		internal.SetPageAllocationObserver(nil)
+		internal.SetPageAllocationTimeSource(nil)
 	}
 }
 
@@ -524,6 +672,9 @@ func (d *Driver) EnableAutoPageReleaseDryRun(outputDir string) {
 	if d.pageAllocTracer == nil {
 		d.pageAllocTracer = newEpochPageAllocTracer("", d.memAllocator.RemovePage)
 		internal.SetPageAllocationObserver(d.pageAllocTracer)
+		internal.SetPageAllocationTimeSource(func() sim.VTimeInSec {
+			return d.Engine.CurrentTime()
+		})
 	}
 
 	d.pageAllocTracer.enableAutoReleaseDryRun(outputDir)
@@ -539,6 +690,7 @@ func (d *Driver) DisableAutoPageReleaseDryRun() {
 	if d.pageAllocTracer.isIdle() {
 		d.pageAllocTracer = nil
 		internal.SetPageAllocationObserver(nil)
+		internal.SetPageAllocationTimeSource(nil)
 	}
 }
 
@@ -547,6 +699,9 @@ func (d *Driver) EnableAutoPageReleaseEnforce(outputDir string) {
 	if d.pageAllocTracer == nil {
 		d.pageAllocTracer = newEpochPageAllocTracer("", d.memAllocator.RemovePage)
 		internal.SetPageAllocationObserver(d.pageAllocTracer)
+		internal.SetPageAllocationTimeSource(func() sim.VTimeInSec {
+			return d.Engine.CurrentTime()
+		})
 	}
 
 	d.pageAllocTracer.enableAutoReleaseEnforce(outputDir)
@@ -562,6 +717,7 @@ func (d *Driver) DisableAutoPageReleaseEnforce() {
 	if d.pageAllocTracer.isIdle() {
 		d.pageAllocTracer = nil
 		internal.SetPageAllocationObserver(nil)
+		internal.SetPageAllocationTimeSource(nil)
 	}
 }
 
@@ -571,7 +727,7 @@ func (d *Driver) ObservePageAccessForAutoRelease(pid vm.PID, pageVAddr uint64) {
 		return
 	}
 
-	d.pageAllocTracer.OnPageAccess(pid, pageVAddr)
+	d.pageAllocTracer.OnPageAccess(pid, pageVAddr, d.Engine.CurrentTime())
 }
 
 // BeginEpochPageAllocationTrace marks epoch start for all provided contexts.
@@ -579,9 +735,10 @@ func (d *Driver) BeginEpochPageAllocationTrace(contexts []*Context, epoch int) {
 	if d.pageAllocTracer == nil {
 		return
 	}
+	now := d.Engine.CurrentTime()
 
 	for _, pid := range uniquePIDs(contexts) {
-		d.pageAllocTracer.beginEpochForPID(pid, epoch)
+		d.pageAllocTracer.beginEpochForPID(pid, epoch, now)
 	}
 }
 
@@ -593,12 +750,13 @@ func (d *Driver) EndEpochPageAllocationTrace(contexts []*Context) error {
 	}
 
 	flushedEpochs := make(map[int]bool)
+	now := d.Engine.CurrentTime()
 	for _, pid := range uniquePIDs(contexts) {
-		epoch, shouldFlush := d.pageAllocTracer.endEpochForPID(pid)
+		epoch, shouldFlush, epochEndTime := d.pageAllocTracer.endEpochForPID(pid, now)
 		if !shouldFlush || flushedEpochs[epoch] {
 			continue
 		}
-		if err := d.pageAllocTracer.flushEpoch(epoch); err != nil {
+		if err := d.pageAllocTracer.flushEpoch(epoch, epochEndTime); err != nil {
 			return err
 		}
 		flushedEpochs[epoch] = true

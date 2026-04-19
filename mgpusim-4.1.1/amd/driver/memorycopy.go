@@ -57,6 +57,7 @@ func (m *defaultMemoryCopyMiddleware) processMemCopyH2DCommand(
 		if !found {
 			panic("page not found")
 		}
+		m.driver.ObservePageAccessForAutoRelease(queue.Context.pid, page.VAddr)
 
 		pAddr := page.PAddr + (addr - page.VAddr)
 		sizeLeftInPage := page.PageSize - (addr - page.VAddr)
@@ -107,6 +108,7 @@ func (m *defaultMemoryCopyMiddleware) processMemCopyD2HCommand(
 		if !found {
 			panic("page not found")
 		}
+		m.driver.ObservePageAccessForAutoRelease(queue.Context.pid, page.VAddr)
 
 		pAddr := page.PAddr + (addr - page.VAddr)
 		sizeLeftInPage := page.PageSize - (addr - page.VAddr)

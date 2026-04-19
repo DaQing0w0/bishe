@@ -177,8 +177,29 @@ func (d *Driver) Tick() bool {
 	madeProgress = d.processReturnReq() || madeProgress
 	madeProgress = d.processNewCommand() || madeProgress
 	madeProgress = d.parseFromMMU() || madeProgress
+	if d.pageAllocTracer != nil && !d.hasPendingCommands() {
+		madeProgress = d.pageAllocTracer.processDueReleases(d.Engine.CurrentTime()) || madeProgress
+	}
 
 	return madeProgress
+}
+
+func (d *Driver) hasPendingCommands() bool {
+	d.contextMutex.Lock()
+	defer d.contextMutex.Unlock()
+
+	for _, ctx := range d.contexts {
+		ctx.queueMutex.Lock()
+		for _, q := range ctx.queues {
+			if q.IsRunning || q.NumCommand() > 0 {
+				ctx.queueMutex.Unlock()
+				return true
+			}
+		}
+		ctx.queueMutex.Unlock()
+	}
+
+	return false
 }
 
 func (d *Driver) sendToGPUs() bool {
