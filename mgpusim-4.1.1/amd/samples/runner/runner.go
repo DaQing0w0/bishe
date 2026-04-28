@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	// Enable profiling
 	_ "net/http/pprof"
@@ -261,6 +262,7 @@ func (r *Runner) AddBenchmarkWithoutSettingGPUsToUse(b benchmarks.Benchmark) {
 
 // Run runs the benchmark
 func (r *Runner) Run() {
+	start := time.Now()
 	r.Driver().Run()
 
 	var wg sync.WaitGroup
@@ -293,6 +295,8 @@ func (r *Runner) Run() {
 	if r.memLog != nil {
 		r.memLog.Close()
 	}
+
+	log.Printf("[run] total wall time: %s", time.Since(start))
 }
 
 // Driver returns the GPU driver used by the current runner.
