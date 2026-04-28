@@ -30,6 +30,14 @@ type Benchmark struct {
 	MaxBatchPerEpoch   int
 	EnableTesting      bool
 	EnableVerification bool
+	Lite               bool
+
+	EnablePageAllocationTrace    bool
+	PageAllocationTraceDir       string
+	EnableAutoPageReleaseDryRun  bool
+	AutoPageReleaseDryRunDir     string
+	EnableAutoPageReleaseEnforce bool
+	AutoPageReleaseEnforceDir    string
 }
 
 // NewBenchmark creates a new benchmark.
@@ -60,55 +68,91 @@ func (b *Benchmark) defineNetwork(gpuID int) {
 	context := b.driver.InitWithExistingPID(b.ctx)
 	b.driver.SelectGPU(context, gpuID)
 	to := gputensor.NewGPUOperator(b.driver, context)
+	inputSize := imagenet.InputImageSize()
 
 	if b.EnableVerification {
 		to.EnableVerification()
 	}
 
-	network := training.Network{
-		Layers: []layers.Layer{
-			layers.NewConv2D(0, to, []int{3, 224, 224}, []int{64, 3, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(2, to, []int{64, 224, 224}, []int{64, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+	var network training.Network
+	if b.Lite {
+		if inputSize%4 != 0 {
+			panic("vgg16 lite requires -img-size divisible by 4")
+		}
 
-			layers.NewConv2D(5, to, []int{64, 112, 112}, []int{128, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(7, to, []int{128, 112, 112}, []int{128, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(9, to, []int{128, 112, 112}, []int{128, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+		s1 := inputSize / 2
+		s2 := s1 / 2
 
-			layers.NewConv2D(12, to, []int{128, 56, 56}, []int{256, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(14, to, []int{256, 56, 56}, []int{256, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(16, to, []int{256, 56, 56}, []int{256, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+		network = training.Network{
+			Layers: []layers.Layer{
+				layers.NewConv2D(0, to, []int{3, inputSize, inputSize}, []int{16, 3, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
 
-			layers.NewConv2D(19, to, []int{256, 28, 28}, []int{512, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(21, to, []int{512, 28, 28}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(23, to, []int{512, 28, 28}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+				layers.NewConv2D(2, to, []int{16, s1, s1}, []int{32, 16, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
 
-			layers.NewConv2D(26, to, []int{512, 14, 14}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(27, to, []int{512, 14, 14}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewConv2D(29, to, []int{512, 14, 14}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
-			layers.NewReluLayer(to),
-			layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+				layers.NewAvgPoolingLayer(to, []int{s2, s2}, []int{0, 0}, []int{s2, s2}),
+				layers.NewFullyConnectedLayer(4, to, 32, 200),
+			},
+		}
+	} else {
+		if inputSize%32 != 0 {
+			panic("vgg16 full requires -img-size divisible by 32")
+		}
 
-			layers.NewFullyConnectedLayer(32, to, 7*7*512, 2*2*512),
-			layers.NewReluLayer(to),
-			layers.NewFullyConnectedLayer(34, to, 2*2*512, 200),
-		},
+		s1 := inputSize / 2
+		s2 := s1 / 2
+		s3 := s2 / 2
+		s4 := s3 / 2
+		s5 := s4 / 2
+
+		network = training.Network{
+			Layers: []layers.Layer{
+				layers.NewConv2D(0, to, []int{3, inputSize, inputSize}, []int{64, 3, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(2, to, []int{64, inputSize, inputSize}, []int{64, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+
+				layers.NewConv2D(5, to, []int{64, s1, s1}, []int{128, 64, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(7, to, []int{128, s1, s1}, []int{128, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(9, to, []int{128, s1, s1}, []int{128, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+
+				layers.NewConv2D(12, to, []int{128, s2, s2}, []int{256, 128, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(14, to, []int{256, s2, s2}, []int{256, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(16, to, []int{256, s2, s2}, []int{256, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+
+				layers.NewConv2D(19, to, []int{256, s3, s3}, []int{512, 256, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(21, to, []int{512, s3, s3}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(23, to, []int{512, s3, s3}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+
+				layers.NewConv2D(26, to, []int{512, s4, s4}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(27, to, []int{512, s4, s4}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewConv2D(29, to, []int{512, s4, s4}, []int{512, 512, 3, 3}, []int{1, 1}, []int{1, 1}),
+				layers.NewReluLayer(to),
+				layers.NewMaxPoolingLayer(to, []int{2, 2}, []int{0, 0}, []int{2, 2}),
+
+				layers.NewFullyConnectedLayer(32, to, s5*s5*512, 2*2*512),
+				layers.NewReluLayer(to),
+				layers.NewFullyConnectedLayer(34, to, 2*2*512, 200),
+			},
+		}
 	}
 
 	b.networks = append(b.networks, network)
@@ -150,6 +194,13 @@ func (b *Benchmark) createTrainer() {
 		GPUs:             b.gpus,
 		Contexts:         b.contexts,
 		Driver:           b.driver,
+
+		EnableEpochPageAllocTrace:    b.EnablePageAllocationTrace,
+		PageAllocTraceDir:            b.PageAllocationTraceDir,
+		EnableAutoPageReleaseDryRun:  b.EnableAutoPageReleaseDryRun,
+		AutoPageReleaseDryRunDir:     b.AutoPageReleaseDryRunDir,
+		EnableAutoPageReleaseEnforce: b.EnableAutoPageReleaseEnforce,
+		AutoPageReleaseEnforceDir:    b.AutoPageReleaseEnforceDir,
 	}
 }
 

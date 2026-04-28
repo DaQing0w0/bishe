@@ -31,6 +31,13 @@ type Benchmark struct {
 	MaxBatchPerEpoch   int
 	EnableVerification bool
 	EnableTesting      bool
+
+	EnablePageAllocationTrace    bool
+	PageAllocationTraceDir       string
+	EnableAutoPageReleaseDryRun  bool
+	AutoPageReleaseDryRunDir     string
+	EnableAutoPageReleaseEnforce bool
+	AutoPageReleaseEnforceDir    string
 }
 
 // NewBenchmark creates a new benchmark.
@@ -142,6 +149,13 @@ func (b *Benchmark) createTrainer() {
 		GPUs:             b.gpus,
 		Contexts:         b.contexts,
 		Driver:           b.driver,
+
+		EnableEpochPageAllocTrace:    b.EnablePageAllocationTrace,
+		PageAllocTraceDir:            b.PageAllocationTraceDir,
+		EnableAutoPageReleaseDryRun:  b.EnableAutoPageReleaseDryRun,
+		AutoPageReleaseDryRunDir:     b.AutoPageReleaseDryRunDir,
+		EnableAutoPageReleaseEnforce: b.EnableAutoPageReleaseEnforce,
+		AutoPageReleaseEnforceDir:    b.AutoPageReleaseEnforceDir,
 	}
 }
 

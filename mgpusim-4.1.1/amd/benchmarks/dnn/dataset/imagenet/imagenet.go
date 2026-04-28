@@ -16,6 +16,14 @@ import (
 
 var imagenetDataFolder = flag.String("imagenet-data-folder", "",
 	"Specifies where the imagenet data is located at.")
+var imagenetInputSize = flag.Int("img-size", 96,
+	"Input image resolution (square) used by ImageNet loader and VGG16.")
+var imagenetTrainClassCount = flag.Int("img-tr-classes", 200,
+	"Number of training classes to iterate through.")
+var imagenetTrainImagesPerClass = flag.Int("img-tr-per-class", 500,
+	"Number of training images to iterate per class.")
+var imagenetValImageCount = flag.Int("img-val-count", 10000,
+	"Number of validation images to iterate through.")
 
 // The DataSet can provide imagenet data.
 type DataSet struct {
@@ -81,18 +89,24 @@ func NewDataSet(isTrain bool) *DataSet {
 
 // HasNext returns true if there are more images in the dataset.
 func (d *DataSet) HasNext() bool {
+	trainClassCount := clampPositive(*imagenetTrainClassCount)
+	trainImagesPerClass := clampPositive(*imagenetTrainImagesPerClass)
+	valImageCount := clampPositive(*imagenetValImageCount)
+
 	if d.isTrain {
-		return d.curClass < 200 && d.curImage < 500
+		return d.curClass < trainClassCount && d.curImage < trainImagesPerClass
 	}
 
-	return d.curImage < 10000
+	return d.curImage < valImageCount
 }
 
 // Next returns the next image and label. It panics if there is no more images
 // in the dataset.
 func (d *DataSet) Next() (imageData []byte, labelData byte) {
 	var err error
-	var imageArray [224 * 224 * 3]byte
+	imageSize := InputImageSize()
+	imageArea := imageSize * imageSize
+	imageArray := make([]byte, imageArea*3)
 	var label byte
 	var imagePath string
 	var className string
@@ -111,22 +125,24 @@ func (d *DataSet) Next() (imageData []byte, labelData byte) {
 	defer f.Close()
 
 	img, _, err := image.Decode(f)
-	img224 := imaging.Resize(img, 224, 224, imaging.Lanczos)
+	resized := imaging.Resize(img, imageSize, imageSize, imaging.Lanczos)
 	dieOnErr(err)
-	for i := 0; i < 224; i++ {
-		for j := 0; j < 224; j++ {
-			r, g, b, _ := img224.At(i, j).RGBA()
-			imageArray[i*j] = uint8(r >> 8)
-			imageArray[i*j+224*224] = uint8(g >> 8)
-			imageArray[i*j+224*224*2] = uint8(b >> 8)
+	for i := 0; i < imageSize; i++ {
+		for j := 0; j < imageSize; j++ {
+			r, g, b, _ := resized.At(i, j).RGBA()
+			idx := i*imageSize + j
+			imageArray[idx] = uint8(r >> 8)
+			imageArray[idx+imageArea] = uint8(g >> 8)
+			imageArray[idx+imageArea*2] = uint8(b >> 8)
 		}
 	}
 
 	if d.isTrain {
 		label = uint8(d.mapClassToLabel[className])
+		trainImagesPerClass := clampPositive(*imagenetTrainImagesPerClass)
 
 		d.curImage++
-		if d.curImage >= 500 {
+		if d.curImage >= trainImagesPerClass {
 			d.curClass++
 			d.curImage = 0
 		}
@@ -136,7 +152,7 @@ func (d *DataSet) Next() (imageData []byte, labelData byte) {
 		d.curImage++
 	}
 
-	return imageArray[:], label
+	return imageArray, label
 }
 
 // Reset lets the dataset to read from the beginning.
@@ -163,4 +179,17 @@ func dieOnErr(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func clampPositive(v int) int {
+	if v <= 0 {
+		return 1
+	}
+
+	return v
+}
+
+// InputImageSize returns the configured square image size.
+func InputImageSize() int {
+	return clampPositive(*imagenetInputSize)
 }
