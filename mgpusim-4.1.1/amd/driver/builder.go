@@ -114,6 +114,11 @@ func (b Builder) Build(name string) *Driver {
 	driver.enqueueSignal = make(chan bool)
 	driver.driverStopped = make(chan bool)
 
+	driver.autoReleaseOverheadEnabled = true
+	driver.autoReleaseOverheadAccessNs = defaultAutoReleaseAccessNs
+	driver.autoReleaseOverheadReleaseBatchNs = defaultAutoReleaseReleaseBatchNs
+	driver.autoReleaseOverheadReleasePageNs = defaultAutoReleaseReleasePageNs
+
 	b.createCPU(driver)
 
 	return driver

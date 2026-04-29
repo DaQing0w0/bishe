@@ -2,9 +2,11 @@ package driver
 
 import (
 	"log"
+	"math"
 	"reflect"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rs/xid"
 	"github.com/sarchlab/akita/v4/mem/mem"
@@ -61,12 +63,79 @@ type Driver struct {
 	RemotePMCPorts []sim.Port
 
 	pageAllocTracer *epochPageAllocTracer
+
+	autoReleaseOverheadEnabled        bool
+	autoReleaseOverheadAccessNs       float64
+	autoReleaseOverheadReleaseBatchNs float64
+	autoReleaseOverheadReleasePageNs  float64
+	autoReleaseOverheadCycles         int64
 }
+
+const (
+	defaultAutoReleaseAccessNs       = 61.974
+	defaultAutoReleaseReleaseBatchNs = 183.250995
+	defaultAutoReleaseReleasePageNs  = 188.463947
+)
 
 // Run starts a new threads that handles all commands in the command queues
 func (d *Driver) Run() {
 	d.logSimulationStart()
 	go d.runAsync()
+}
+
+// EnableAutoReleaseOverhead toggles whether auto-release overhead is added into simulated time.
+func (d *Driver) EnableAutoReleaseOverhead(enable bool) {
+	d.autoReleaseOverheadEnabled = enable
+}
+
+// SetAutoReleaseOverheadCosts updates overhead costs in nanoseconds.
+func (d *Driver) SetAutoReleaseOverheadCosts(accessNs, releaseBatchNs, releasePageNs float64) {
+	d.autoReleaseOverheadAccessNs = accessNs
+	d.autoReleaseOverheadReleaseBatchNs = releaseBatchNs
+	d.autoReleaseOverheadReleasePageNs = releasePageNs
+}
+
+func (d *Driver) addAutoReleaseOverheadNs(ns float64) {
+	if !d.autoReleaseOverheadEnabled || ns <= 0 {
+		return
+	}
+	cyclesFloat := ns * float64(d.Freq) * 1e-9
+	cycles := int64(math.Ceil(cyclesFloat))
+	if cycles <= 0 {
+		return
+	}
+	prev := atomic.AddInt64(&d.autoReleaseOverheadCycles, cycles) - cycles
+	if prev == 0 {
+		d.TickLater()
+	}
+}
+
+func (d *Driver) addAutoReleaseAccessOverhead() {
+	d.addAutoReleaseOverheadNs(d.autoReleaseOverheadAccessNs)
+}
+
+func (d *Driver) addAutoReleaseReleaseOverhead(pages int) {
+	if pages <= 0 {
+		return
+	}
+	pagesNs := d.autoReleaseOverheadReleasePageNs * float64(pages)
+	batchNs := d.autoReleaseOverheadReleaseBatchNs
+	d.addAutoReleaseOverheadNs(batchNs + pagesNs)
+}
+
+func (d *Driver) consumeAutoReleaseOverhead() bool {
+	if !d.autoReleaseOverheadEnabled {
+		return false
+	}
+	for {
+		cur := atomic.LoadInt64(&d.autoReleaseOverheadCycles)
+		if cur <= 0 {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&d.autoReleaseOverheadCycles, cur, cur-1) {
+			return true
+		}
+	}
 }
 
 // Terminate stops the driver thread execution.
@@ -164,6 +233,9 @@ func (d *Driver) RegisterGPU(
 
 // Tick ticks
 func (d *Driver) Tick() bool {
+	if d.consumeAutoReleaseOverhead() {
+		return true
+	}
 	madeProgress := false
 
 	madeProgress = d.sendToGPUs() || madeProgress
@@ -178,7 +250,11 @@ func (d *Driver) Tick() bool {
 	madeProgress = d.processNewCommand() || madeProgress
 	madeProgress = d.parseFromMMU() || madeProgress
 	if d.pageAllocTracer != nil && !d.hasPendingCommands() {
-		madeProgress = d.pageAllocTracer.processDueReleases(d.Engine.CurrentTime()) || madeProgress
+		released := d.pageAllocTracer.processDueReleases(d.Engine.CurrentTime())
+		if released > 0 {
+			d.addAutoReleaseReleaseOverhead(released)
+			madeProgress = true
+		}
 	}
 
 	return madeProgress

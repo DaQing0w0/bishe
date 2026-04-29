@@ -25,12 +25,12 @@ var enablePageAllocationTraceFlag = flag.Bool("enable-page-allocation-trace", tr
 var pageAllocationTraceDirFlag = flag.String("page-allocation-trace-dir",
 	"lenet_page_alloc_trace_off",
 	"Directory for page allocation trace CSV files.")
-var enableAutoPageReleaseDryRunFlag = flag.Bool("enable-auto-page-release-dry-run", false,
+var enableAutoPageReleaseDryRunFlag = flag.Bool("enable-auto-page-release-dry-run", true,
 	"Enable auto page release dry-run mode.")
 var autoPageReleaseDryRunDirFlag = flag.String("auto-page-release-dry-run-dir",
 	"lenet_auto_release_dry_run",
 	"Directory for auto page release dry-run CSV files.")
-var enableAutoPageReleaseEnforceFlag = flag.Bool("enable-auto-page-release-enforce", true,
+var enableAutoPageReleaseEnforceFlag = flag.Bool("enable-auto-page-release-enforce", false,
 	"Enable auto page release enforce mode.")
 var autoPageReleaseEnforceDirFlag = flag.String("auto-page-release-enforce-dir",
 	"lenet_auto_release_enforce_off",

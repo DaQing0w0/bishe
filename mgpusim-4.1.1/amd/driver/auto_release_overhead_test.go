@@ -69,7 +69,7 @@ func benchmarkProcessDueReleases(b *testing.B, size int) {
 		}
 
 		b.StartTimer()
-		tracer.processDueReleases(now)
+		_ = tracer.processDueReleases(now)
 		b.StopTimer()
 	}
 }

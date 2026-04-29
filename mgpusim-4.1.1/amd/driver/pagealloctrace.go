@@ -151,11 +151,11 @@ func (t *epochPageAllocTracer) isIdle() bool {
 	return !t.allocTraceOn && !t.dryRunOn && !t.enforceOn
 }
 
-func (t *epochPageAllocTracer) processDueReleases(now sim.VTimeInSec) bool {
+func (t *epochPageAllocTracer) processDueReleases(now sim.VTimeInSec) int {
 	t.mu.Lock()
 	if !t.enforceOn || t.releasePage == nil {
 		t.mu.Unlock()
-		return false
+		return 0
 	}
 
 	type releaseItem struct {
@@ -194,7 +194,7 @@ func (t *epochPageAllocTracer) processDueReleases(now sim.VTimeInSec) bool {
 		t.releasePage(r.vAddr)
 	}
 
-	return len(releases) > 0
+	return len(releases)
 }
 
 func (t *epochPageAllocTracer) OnPageAllocated(event internal.PageAllocationEvent) {
@@ -352,7 +352,7 @@ func (t *epochPageAllocTracer) endEpochForPID(pid vm.PID, now sim.VTimeInSec) (
 	return epoch, true, now
 }
 
-func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec) error {
+func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec) (int, error) {
 	t.mu.Lock()
 	records := append([]epochPageAllocRecord(nil), t.recordsByEpoch[epoch]...)
 	accessBySeq := make(map[uint64]uint64)
@@ -413,8 +413,10 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 
 	t.mu.Unlock()
 
+	releaseCount := 0
+
 	if len(records) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	sort.Slice(records, func(i, j int) bool {
@@ -423,13 +425,13 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 
 	if allocTraceOn {
 		if err := os.MkdirAll(allocOutDir, 0o755); err != nil {
-			return err
+			return 0, err
 		}
 
 		filePath := filepath.Join(allocOutDir, fmt.Sprintf("epoch_%04d_page_alloc.csv", epoch))
 		f, err := os.Create(filePath)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer f.Close()
 
@@ -439,7 +441,7 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 		if err := w.Write([]string{
 			"seq", "epoch", "pid", "cause", "vaddr_hex", "paddr_hex", "page_size", "device_id", "unified",
 		}); err != nil {
-			return err
+			return 0, err
 		}
 
 		for _, r := range records {
@@ -454,24 +456,24 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 				strconv.FormatUint(r.DeviceID, 10),
 				strconv.FormatBool(r.Unified),
 			}); err != nil {
-				return err
+				return 0, err
 			}
 		}
 
 		if err := w.Error(); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
 	if dryRunOn && epoch >= 2 {
 		if err := os.MkdirAll(dryRunOutDir, 0o755); err != nil {
-			return err
+			return 0, err
 		}
 
 		filePath := filepath.Join(dryRunOutDir, fmt.Sprintf("epoch_%04d_auto_release_dry_run.csv", epoch))
 		f, err := os.Create(filePath)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer f.Close()
 
@@ -482,7 +484,7 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 			"seq", "epoch", "baseline_access", "current_access", "would_release", "post_threshold_access",
 			"alloc_time", "candidate_release_time", "candidate_lifetime", "epoch_runtime", "candidate_lifetime_epoch_runtime_ratio",
 		}); err != nil {
-			return err
+			return 0, err
 		}
 
 		epochRuntime := epochEndTime - epochStartTime
@@ -522,12 +524,12 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 				epochRuntimeStr,
 				candidateRatioStr,
 			}); err != nil {
-				return err
+				return 0, err
 			}
 		}
 
 		if err := w.Error(); err != nil {
-			return err
+			return 0, err
 		}
 
 		log.Printf("[auto-release-dry-run] epoch=%d would_release=%d unknown_seq_access=%d", epoch, len(wouldRelease), unknownSeq)
@@ -547,17 +549,18 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 				t.releasePage(r.VAddr)
 				released[r.Seq] = true
 				releasedTimeBySeq[r.Seq] = epochEndTime
+				releaseCount++
 			}
 		}
 
 		if err := os.MkdirAll(enforceOutDir, 0o755); err != nil {
-			return err
+			return 0, err
 		}
 
 		filePath := filepath.Join(enforceOutDir, fmt.Sprintf("epoch_%04d_auto_release_enforce.csv", epoch))
 		f, err := os.Create(filePath)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer f.Close()
 
@@ -568,7 +571,7 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 			"seq", "epoch", "baseline_access", "current_access", "would_release", "did_release", "post_threshold_access",
 			"alloc_time", "release_time", "lifetime", "epoch_runtime", "lifetime_epoch_runtime_ratio",
 		}); err != nil {
-			return err
+			return 0, err
 		}
 
 		epochRuntime := epochEndTime - epochStartTime
@@ -609,18 +612,18 @@ func (t *epochPageAllocTracer) flushEpoch(epoch int, epochEndTime sim.VTimeInSec
 				epochRuntimeStr,
 				ratioStr,
 			}); err != nil {
-				return err
+				return 0, err
 			}
 		}
 
 		if err := w.Error(); err != nil {
-			return err
+			return 0, err
 		}
 
 		log.Printf("[auto-release-enforce] epoch=%d released=%d unknown_seq_access=%d", epoch, len(released), unknownSeq)
 	}
 
-	return nil
+	return releaseCount, nil
 }
 
 func uniquePIDs(contexts []*Context) []vm.PID {
@@ -728,6 +731,7 @@ func (d *Driver) ObservePageAccessForAutoRelease(pid vm.PID, pageVAddr uint64) {
 	}
 
 	d.pageAllocTracer.OnPageAccess(pid, pageVAddr, d.Engine.CurrentTime())
+	d.addAutoReleaseAccessOverhead()
 }
 
 // BeginEpochPageAllocationTrace marks epoch start for all provided contexts.
@@ -756,8 +760,12 @@ func (d *Driver) EndEpochPageAllocationTrace(contexts []*Context) error {
 		if !shouldFlush || flushedEpochs[epoch] {
 			continue
 		}
-		if err := d.pageAllocTracer.flushEpoch(epoch, epochEndTime); err != nil {
+		released, err := d.pageAllocTracer.flushEpoch(epoch, epochEndTime)
+		if err != nil {
 			return err
+		}
+		if released > 0 {
+			d.addAutoReleaseReleaseOverhead(released)
 		}
 		flushedEpochs[epoch] = true
 	}
